@@ -16,6 +16,7 @@ const equipment = db.collection("equipment");
 const bookings = db.collection("bookings");
 const favorites = db.collection("favorites");
 const userFields = { name: 1, email: 1, role: 1, createdAt: 1, image: 1 };
+const adminUserFields = { ...userFields, phone: 1, address: 1 };
 const roles = ["Customer", "Owner", "Admin"];
 const daysPerPeriod = { Daily: 1, Weekly: 7, Monthly: 30 };
 const millisecondsPerDay = 86_400_000;
@@ -165,7 +166,31 @@ manageEquipment("owner");
 manageEquipment("admin");
 
 app.get("/admin/equipment", verifyToken, verifyAdmin, async (_, res) => res.json(await equipment.find().toArray()));
-app.get("/admin/users", verifyToken, verifyAdmin, async (_, res) => res.json(await users.find({}, { projection: userFields }).toArray()));
+app.get("/admin/users", verifyToken, verifyAdmin, async (_, res) => res.json(await users.find({}, { projection: adminUserFields }).toArray()));
+// Edit profile fields only. The role endpoint handles permissions separately.
+app.patch("/admin/users/:id/profile", verifyToken, verifyAdmin, async (req, res) => {
+  const limits = { name: 100, phone: 40, address: 400, image: 2048 };
+  const profile = {};
+  for (const [field, maxLength] of Object.entries(limits)) {
+    const value = req.body?.[field];
+    if (typeof value !== "string" || value.trim().length > maxLength) {
+      fail(400, "Check the profile fields and try again.");
+    }
+    profile[field] = value.trim();
+  }
+  if (!profile.name) fail(400, "Enter the user's name.");
+  if (profile.image && (!URL.canParse(profile.image) || !/^https?:\/\//i.test(profile.image))) {
+    fail(400, "Enter a valid photo URL.");
+  }
+  const user = await users.findOneAndUpdate(
+    { _id: objectId(req.params.id) },
+    { $set: { ...profile, image: profile.image || null, updatedAt: new Date() } },
+    { projection: adminUserFields, returnDocument: "after" },
+  );
+  if (!user) fail(404, "User not found.");
+  res.json(user);
+});
+
 app.patch("/admin/users/:id", verifyToken, verifyAdmin, async (req, res) => {
   const id = objectId(req.params.id);
   if (id.equals(req.user._id)) fail(400, "Use another administrator to update your role.");
@@ -200,6 +225,10 @@ function parseDay(value) {
 
 app.post("/bookings", verifyToken, verifyRenter, async (req, res) => {
   const equipmentId = objectId(req.body.equipmentId);
+  const paymentMethod = req.body.paymentMethod ?? "Manual";
+  if (paymentMethod !== "Manual" && paymentMethod !== "Cash on delivery") {
+    fail(400, "Choose a supported payment method.");
+  }
   const start = parseDay(req.body.start);
   const end = parseDay(req.body.end);
   // Count both the first and last rental day.
@@ -239,7 +268,7 @@ app.post("/bookings", verifyToken, verifyRenter, async (req, res) => {
       customerName: req.user.name, ownerId: item.ownerId, ownerName: item.ownerName,
       start, end, days, quantity, total, phone, address,
       notes: String(req.body.notes || "").slice(0, 1000),
-      status: "Confirmed", paymentStatus: "Unpaid", paymentMethod: "Manual", createdAt: new Date(),
+      status: "Confirmed", paymentStatus: "Unpaid", paymentMethod, createdAt: new Date(),
     }, { session });
   }));
   res.status(201).json({ id: result.insertedId });
