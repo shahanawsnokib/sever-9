@@ -28,13 +28,26 @@ Sign out and back in after changing the role. The Admin dashboard can assign Own
 
 In a demo database, run `node seed-demo.js owner@example.com` with the email of an existing Owner. This adds six approved sample listings for that account. Use real listings for a public deployment.
 
-### Add a payment gateway later
+### Stripe Checkout
 
-The `POST /bookings` route is the integration point. It owns the calculation and availability check. For online checkout, create a short-lived pending reservation here and start the provider checkout using the server-calculated amount. Add a signed webhook to reconcile successful payments. In one transaction, save each unique provider transaction ID in a payments collection and update the matching booking to Paid and Confirmed. Expire unpaid reservations and release stock. Keep gateway secrets in this server's environment. Keep the existing **Mark paid** action for offline payments.
+1. Put your Stripe test secret key in the server’s private `.env` as `STRIPE_SECRET_KEY` (starts with `sk_test_`).
+2. Log in to the [Stripe CLI](https://docs.stripe.com/cli/login.md) and forward events to the local API. Change port 8000 if the API uses another port.
+
+   ```sh
+   stripe listen --events checkout.session.completed,checkout.session.expired,checkout.session.async_payment_succeeded,checkout.session.async_payment_failed --forward-to http://localhost:8000/payments/stripe/webhook
+   ```
+
+3. Copy the listener's `whsec_` signing secret into `STRIPE_WEBHOOK_SECRET` in the server’s private `.env`, then start or restart Express. Keep the listener running while testing.
+4. Sign in as a Customer and choose **Pay online** from a booking form. Checkout charges the server-calculated amount in BDT. The signed webhook confirms the booking and records the Stripe transaction in MongoDB. The success page checks the recorded payment status.
+
+For deployment, register an HTTPS endpoint at `/payments/stripe/webhook` in Stripe for the same events. Use the deployed endpoint’s signing secret and set `FRONTEND_URL` to the live web address. Use matching test or live credentials. [Stripe webhook setup](https://docs.stripe.com/events/set-up-events.md)
+
+Cash on delivery remains available. Admins can mark those bookings paid manually. An unpaid Stripe reservation releases its stock when Stripe confirms expiry or the customer cancels it.
 
 ### Packages
 
 - Express for routing and middleware.
+- Stripe SDK for hosted checkout and signed payment events.
 - MongoDB driver for collections, indexes, and booking transactions.
 - CORS for frontend origin access.
 - dotenv for local environment configuration.
