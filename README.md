@@ -11,6 +11,10 @@ Live URL: Pending deployment.
 3. Set `FRONTEND_URL` to the exact frontend origin and run `npm start`.
 4. The health route is `GET /`. Protected routes accept the short-lived Better Auth JWT and check the current MongoDB user role.
 
+### Where to find the code
+
+The API is in `index.js`. Its comments mark the database and authentication setup, Stripe payments, equipment, users, bookings, and server startup.
+
 ### First administrator
 
 Register the account in the app. Then, in your own MongoDB shell, run the following with that account's email:

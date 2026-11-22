@@ -1,11 +1,11 @@
 import "dotenv/config";
 import cors from "cors";
 import express from "express";
-import { createStripePayments } from "./stripe-payments.js";
 import { createPublicKey, verify } from "node:crypto";
 import { MongoClient, ObjectId } from "mongodb";
+import Stripe from "stripe";
 
-const app = express();
+// Database, server settings, and authentication
 const port = process.env.PORT || 5000;
 const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
 const frontendOrigin = new URL(frontendUrl).origin;
@@ -23,16 +23,9 @@ const stripePayments = createStripePayments({
   webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
 });
 const userFields = { name: 1, email: 1, role: 1, createdAt: 1, image: 1 };
-const adminUserFields = { ...userFields, phone: 1, address: 1 };
-const roles = ["Customer", "Owner", "Admin"];
 const daysPerPeriod = { Daily: 1, Weekly: 7, Monthly: 30 };
-const millisecondsPerDay = 86_400_000;
 
-app.use(cors({ origin: frontendOrigin }));
-app.post("/payments/stripe/webhook", express.raw({ type: "application/json" }), stripePayments.handleWebhook);
-app.use(express.json());
-
-// Route helpers throw errors for the JSON error handler at the bottom.
+// Route helpers throw errors for the JSON error handler in index.js.
 function fail(status, message) {
   throw Object.assign(new Error(message), { status });
 }
@@ -86,8 +79,94 @@ const verifyRenter = allowRole("Customer");
 const verifyOwner = allowRole("Owner");
 const verifyAdmin = allowRole("Admin");
 
+// Stripe Checkout and signed webhooks
+const currency = "bdt";
+
+function createStripePayments({ client, bookings, payments, frontendOrigin, secretKey, webhookSecret }) {
+  const stripe = secretKey && webhookSecret ? new Stripe(secretKey, { timeout: 15_000, maxNetworkRetries: 1 }) : null;
+
+  async function createCheckout(booking) {
+    const id = booking._id.toString();
+    return stripe.checkout.sessions.create({
+      mode: "payment",      client_reference_id: id,
+      metadata: { bookingId: id },
+      line_items: [{
+        quantity: 1,
+        price_data: {
+          currency,
+          unit_amount: Math.round(booking.total * 100),
+          product_data: { name: booking.equipmentName },
+        },
+      }],
+      success_url: frontendOrigin + "/payment/success?booking=" + id,
+      cancel_url: frontendOrigin + "/payment/cancel?booking=" + id,
+      expires_at: Math.floor(Date.now() / 1000) + 31 * 60,
+    }, { idempotencyKey: "machora-booking-" + id });
+  }
+
+  async function cancelCheckout(sessionId) {
+    const checkout = await stripe.checkout.sessions.retrieve(sessionId);
+    if (checkout.status === "expired") return true;
+    if (checkout.status !== "open") return false;
+    const expired = await stripe.checkout.sessions.expire(sessionId);
+    return expired.status === "expired";
+  }
+
+  async function handleWebhook(req, res) {
+    if (!stripe) return res.status(503).json({ message: "Stripe is not configured." });
+
+    let event;
+    try {
+      // Stripe signs the raw request bytes, so verify them before reading the event.
+      event = stripe.webhooks.constructEvent(req.body, req.get("stripe-signature"), webhookSecret);
+    } catch {
+      return res.status(400).json({ message: "Invalid Stripe signature." });
+    }
+
+    const checkout = event.data.object;
+    const match = { stripeSessionId: checkout.id, paymentMethod: "Stripe", status: "Awaiting payment" };
+
+    if (event.type === "checkout.session.expired" || event.type === "checkout.session.async_payment_failed") {
+      await bookings.updateOne(match, { $set: { status: "Cancelled", paymentStatus: "Unpaid" } });
+    } else if (["checkout.session.completed", "checkout.session.async_payment_succeeded"].includes(event.type) && checkout.payment_status === "paid") {
+      await client.withSession((session) => session.withTransaction(async () => {
+        const booking = await bookings.findOne(match, { session });
+        if (!booking) return;
+        if (
+          checkout.client_reference_id !== booking._id.toString() ||
+          checkout.currency !== currency ||
+          checkout.amount_total !== Math.round(booking.total * 100)
+        ) throw new Error("Stripe payment does not match the booking.");
+
+        const paidAt = new Date();
+        // The booking ID is unique in payments, so webhook retries cannot record a second payment.
+        await payments.updateOne({ _id: booking._id }, {
+          $setOnInsert: {
+            bookingId: booking._id, customerId: booking.customerId, ownerId: booking.ownerId,
+            provider: "Stripe", sessionId: checkout.id, paymentIntentId: checkout.payment_intent,
+            amount: checkout.amount_total, currency, paidAt,
+          },
+        }, { session, upsert: true });
+        await bookings.updateOne(match, {
+          $set: { status: "Confirmed", paymentStatus: "Paid", paidAt },
+        }, { session });
+      }));
+    }
+
+    res.json({ received: true });
+  }
+
+  return { enabled: Boolean(stripe), createCheckout, cancelCheckout, handleWebhook };
+}
+
+// Express setup: Stripe needs the original request body before JSON parsing.
+const app = express();
+app.use(cors({ origin: frontendOrigin }));
+app.post("/payments/stripe/webhook", express.raw({ type: "application/json" }), stripePayments.handleWebhook);
+app.use(express.json());
 app.get("/", (_, res) => res.json({ status: "ok", app: "MACHORA" }));
 
+// Equipment and favorites
 // Public catalog. MongoDB applies the filters, sorting, and featured limit.
 app.get("/equipment", async (req, res) => {
   const { search, category, rentalType, min, max, availability, sort, featured } = req.query;
@@ -174,6 +253,27 @@ manageEquipment("owner");
 manageEquipment("admin");
 
 app.get("/admin/equipment", verifyToken, verifyAdmin, async (_, res) => res.json(await equipment.find().toArray()));
+
+// Keep each favorites list scoped to the signed-in customer.
+app.get("/favorites", verifyToken, verifyRenter, async (req, res) => {
+  const saved = await favorites.find({ customerId: req.user._id }).toArray();
+  res.json(await equipment.find({ _id: { $in: saved.map((row) => row.equipmentId) }, status: "Approved" }).toArray());
+});
+app.put("/favorites/:id", verifyToken, verifyRenter, async (req, res) => {
+  const equipmentId = objectId(req.params.id);
+  if (!(await equipment.findOne({ _id: equipmentId, status: "Approved" }))) fail(404, "Equipment not found.");
+  await favorites.updateOne({ customerId: req.user._id, equipmentId }, { $setOnInsert: { createdAt: new Date() } }, { upsert: true });
+  res.json({ ok: true });
+});
+app.delete("/favorites/:id", verifyToken, verifyRenter, async (req, res) => {
+  await favorites.deleteOne({ customerId: req.user._id, equipmentId: objectId(req.params.id) });
+  res.json({ ok: true });
+});
+
+// Admin user management
+const adminUserFields = { ...userFields, phone: 1, address: 1 };
+const roles = ["Customer", "Owner", "Admin"];
+
 app.get("/admin/users", verifyToken, verifyAdmin, async (_, res) => res.json(await users.find({}, { projection: adminUserFields }).toArray()));
 // Edit profile fields only. The role endpoint handles permissions separately.
 app.patch("/admin/users/:id/profile", verifyToken, verifyAdmin, async (req, res) => {
@@ -207,21 +307,8 @@ app.patch("/admin/users/:id", verifyToken, verifyAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-// Keep each favorites list scoped to the signed-in customer.
-app.get("/favorites", verifyToken, verifyRenter, async (req, res) => {
-  const saved = await favorites.find({ customerId: req.user._id }).toArray();
-  res.json(await equipment.find({ _id: { $in: saved.map((row) => row.equipmentId) }, status: "Approved" }).toArray());
-});
-app.put("/favorites/:id", verifyToken, verifyRenter, async (req, res) => {
-  const equipmentId = objectId(req.params.id);
-  if (!(await equipment.findOne({ _id: equipmentId, status: "Approved" }))) fail(404, "Equipment not found.");
-  await favorites.updateOne({ customerId: req.user._id, equipmentId }, { $setOnInsert: { createdAt: new Date() } }, { upsert: true });
-  res.json({ ok: true });
-});
-app.delete("/favorites/:id", verifyToken, verifyRenter, async (req, res) => {
-  await favorites.deleteOne({ customerId: req.user._id, equipmentId: objectId(req.params.id) });
-  res.json({ ok: true });
-});
+// Bookings and payment status
+const millisecondsPerDay = 86_400_000;
 
 // Parse calendar dates as UTC days so rental totals use whole dates.
 function parseDay(value) {
@@ -246,7 +333,12 @@ app.post("/bookings", verifyToken, verifyRenter, async (req, res) => {
   const quantity = Number(req.body.quantity);
   const phone = String(req.body.phone || "").trim().slice(0, 40);
   const address = String(req.body.address || "").trim().slice(0, 400);
-  if (req.body.start < new Date().toISOString().slice(0, 10) || days < 1 || days > 365 || !Number.isSafeInteger(quantity) || quantity < 1 || !phone || !address) fail(400, "Check your dates, quantity, phone, and address.");
+  const today = new Date().toISOString().slice(0, 10);
+  const validDates = req.body.start >= today && days >= 1 && days <= 365;
+  const validQuantity = Number.isSafeInteger(quantity) && quantity > 0;
+  if (!validDates || !validQuantity || !phone || !address) {
+    fail(400, "Check your dates, quantity, phone, and address.");
+  }
 
   const booking = await client.withSession((session) => session.withTransaction(async () => {
     // Updating this item first serializes concurrent reservations for the same equipment.
@@ -368,6 +460,7 @@ app.patch("/admin/bookings/:id", verifyToken, verifyAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+// Error responses and server startup
 app.use((_, res) => res.status(404).json({ message: "Route not found." }));
 app.use((error, req, res, next) => {
   const status = error.status || 500;
