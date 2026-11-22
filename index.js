@@ -1,48 +1,284 @@
-import express from 'express'
-import cors from 'cors'
-import { MongoClient } from 'mongodb';
-import 'dotenv/config'
+import "dotenv/config";
+import cors from "cors";
+import express from "express";
+import { createPublicKey, verify } from "node:crypto";
+import { MongoClient, ObjectId } from "mongodb";
 
-const app = express()
+const app = express();
 const port = process.env.PORT || 5000;
-//MIDDLEWARE
-
-app.use(express.json())
-app.use(cors())
-
-
+const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+const frontendOrigin = new URL(frontendUrl).origin;
+// The frontend and API use the same MongoDB database.
 const client = new MongoClient(process.env.MONGODB_URL);
+const db = client.db("machineRentbd");
+const users = db.collection("user");
+const equipment = db.collection("equipment");
+const bookings = db.collection("bookings");
+const favorites = db.collection("favorites");
+const userFields = { name: 1, email: 1, role: 1, createdAt: 1, image: 1 };
+const roles = ["Customer", "Owner", "Admin"];
+const daysPerPeriod = { Daily: 1, Weekly: 7, Monthly: 30 };
+const millisecondsPerDay = 86_400_000;
 
-export async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log("You successfully connected to MongoDB!");
-    return client;
-  } catch (err) {
-    console.dir(err);
-  }
+app.use(cors({ origin: frontendOrigin }));
+app.use(express.json());
+
+// Route helpers throw errors for the JSON error handler at the bottom.
+function fail(status, message) {
+  throw Object.assign(new Error(message), { status });
 }
 
-const connectedClient = await connectToMongoDB()
-const database = connectedClient.db("machineRentbd")
-const users = database.collection("user")
+function objectId(value) {
+  if (typeof value !== "string" || !/^[a-f0-9]{24}$/i.test(value)) fail(404, "Item not found.");
+  return new ObjectId(value);
+}
 
-app.get('/', (req, res)=> {
-    res.send("Hello Dear!!")
-})
+// Better Auth issues the token. Its public key lets the API verify the signature.
+async function verifyToken(req, res, next) {
+  const token = req.get("authorization")?.match(/^Bearer ([\w.-]+)$/)?.[1];
+  if (!token) return res.status(401).json({ message: "Please sign in." });
 
+  let subject;
+  try {
+    const [header, payload, signature, extra] = token.split(".");
+    if (extra || !signature) throw new Error();
+    const { kid, alg } = JSON.parse(Buffer.from(header, "base64url"));
+    if (alg !== "EdDSA" || typeof kid !== "string") throw new Error();
+    const response = await fetch(frontendOrigin + "/api/auth/jwks", { signal: AbortSignal.timeout(5000) });
+    if (!response.ok) throw new Error();
+    const { keys } = await response.json();
+    const key = createPublicKey({ key: keys.find((item) => item.kid === kid), format: "jwk" });
+    const signedData = Buffer.from(header + "." + payload);
+    const signatureBytes = Buffer.from(signature, "base64url");
+    if (!verify(null, signedData, key, signatureBytes)) throw new Error();
 
-app.get('/users', async(req, res) => {
-  const cursor = users.find({});
-  const allValues = await cursor.toArray()
-  res.send(allValues)
-  console.log(allValues);
-  
-})
+    const claims = JSON.parse(Buffer.from(payload, "base64url"));
+    if (claims.iss !== frontendOrigin || claims.aud !== "machora-api") throw new Error();
+    if (!Number.isFinite(claims.exp) || claims.exp <= Date.now() / 1000) throw new Error();
+    subject = objectId(claims.sub);
+  } catch {
+    return res.status(401).json({ message: "Your session could not be verified." });
+  }
 
+  // Read the current role from MongoDB so an old token cannot keep elevated permissions.
+  req.user = await users.findOne({ _id: subject }, { projection: userFields });
+  if (!req.user) return res.status(401).json({ message: "Account unavailable." });
+  next();
+}
 
+// Add a role check after verifyToken on routes that have restricted access.
+function allowRole(role) {
+  return (req, res, next) => {
+    if ((req.user.role || "Customer") !== role) return res.status(403).json({ message: "Access denied." });
+    next();
+  };
+}
+const verifyRenter = allowRole("Customer");
+const verifyOwner = allowRole("Owner");
+const verifyAdmin = allowRole("Admin");
 
-app.listen(port, ()=> {
-    console.log(`Ther server is runnig on port ${port}`)
-})
+app.get("/", (_, res) => res.json({ status: "ok", app: "MACHORA" }));
 
+// Public catalog. MongoDB applies the filters, sorting, and featured limit.
+app.get("/equipment", async (req, res) => {
+  const { search, category, rentalType, min, max, availability, sort, featured } = req.query;
+  const filter = { status: "Approved" };
+  if (typeof search === "string" && search.trim()) {
+    const pattern = new RegExp(RegExp.escape(search.trim().slice(0, 100)), "i");
+    filter.$or = [{ name: pattern }, { category: pattern }, { location: pattern }];
+  }
+  if (typeof category === "string" && category) filter.category = category;
+  if (typeof rentalType === "string" && Object.hasOwn(daysPerPeriod, rentalType)) filter.rentalType = rentalType;
+  if (availability === "available") filter.quantity = { $gt: 0 };
+  if (availability === "unavailable") filter.quantity = 0;
+  const priceRange = {};
+  if (min && Number.isFinite(Number(min))) priceRange.$gte = Number(min);
+  if (max && Number.isFinite(Number(max))) priceRange.$lte = Number(max);
+  if (Object.keys(priceRange).length > 0) filter.price = priceRange;
+
+  let order = { createdAt: -1 };
+  if (sort === "low") order = { price: 1 };
+  if (sort === "high") order = { price: -1 };
+  const query = equipment.find(filter).sort(order);
+  if (featured === "true") query.limit(6);
+  res.json(await query.toArray());
+});
+
+app.get("/equipment/:id", verifyToken, async (req, res) => {
+  const item = await equipment.findOne({ _id: objectId(req.params.id) });
+  if (!item || (item.status !== "Approved" && req.user.role !== "Admin" && !item.ownerId?.equals(req.user._id))) fail(404, "Equipment unavailable.");
+  res.json(item);
+});
+
+// Both create and edit requests use the same listing validation.
+function equipmentFields(body) {
+  const fields = {};
+  for (const key of ["name", "description", "category", "location", "condition", "brand", "model", "image", "terms", "rentalType"]) {
+    fields[key] = typeof body[key] === "string" ? body[key].trim().slice(0, 2000) : "";
+    if (!fields[key]) fail(400, "Please fill all equipment fields.");
+  }
+  if (!/^https?:\/\//i.test(fields.image)) fail(400, "Enter a direct image URL.");
+  fields.price = Number(body.price);
+  fields.quantity = Number(body.quantity);
+  if (!Object.hasOwn(daysPerPeriod, fields.rentalType) || !Number.isFinite(fields.price) || fields.price <= 0 || !Number.isSafeInteger(fields.quantity) || fields.quantity < 0) fail(400, "Check price, quantity, and rental type.");
+  return fields;
+}
+
+app.post("/owner/equipment", verifyToken, verifyOwner, async (req, res) => {
+  const item = { ...equipmentFields(req.body), status: "Pending", ownerId: req.user._id, ownerName: req.user.name, createdAt: new Date() };
+  const result = await equipment.insertOne(item);
+  res.status(201).json({ id: result.insertedId });
+});
+
+app.get("/owner/equipment", verifyToken, verifyOwner, async (req, res) => {
+  res.json(await equipment.find({ ownerId: req.user._id }).toArray());
+});
+
+// Owners can edit their own listings. Admins can edit or review any listing.
+function manageEquipment(scope) {
+  const checkRole = scope === "owner" ? verifyOwner : verifyAdmin;
+  const path = "/" + scope + "/equipment/:id";
+  const match = (req) => ({
+    _id: objectId(req.params.id),
+    ...(scope === "owner" ? { ownerId: req.user._id } : {}),
+  });
+  app.patch(path, verifyToken, checkRole, async (req, res) => {
+    const status = req.body.status;
+    let update;
+    if (scope === "admin" && ["Approved", "Rejected", "Pending"].includes(status)) {
+      update = { status };
+    } else {
+      update = equipmentFields(req.body);
+      if (scope === "owner") update.status = "Pending";
+    }
+
+    const result = await equipment.updateOne(match(req), { $set: update });
+    if (result.matchedCount === 0) fail(404, "Equipment not found.");
+    res.json({ ok: true });
+  });
+  app.delete(path, verifyToken, checkRole, async (req, res) => {
+    if (!(await equipment.deleteOne(match(req))).deletedCount) fail(404, "Equipment not found.");
+    res.json({ ok: true });
+  });
+}
+manageEquipment("owner");
+manageEquipment("admin");
+
+app.get("/admin/equipment", verifyToken, verifyAdmin, async (_, res) => res.json(await equipment.find().toArray()));
+app.get("/admin/users", verifyToken, verifyAdmin, async (_, res) => res.json(await users.find({}, { projection: userFields }).toArray()));
+app.patch("/admin/users/:id", verifyToken, verifyAdmin, async (req, res) => {
+  const id = objectId(req.params.id);
+  if (id.equals(req.user._id)) fail(400, "Use another administrator to update your role.");
+  if (!roles.includes(req.body.role)) fail(400, "Choose a valid role.");
+  if (!(await users.updateOne({ _id: id }, { $set: { role: req.body.role } })).matchedCount) fail(404, "User not found.");
+  res.json({ ok: true });
+});
+
+// Keep each favorites list scoped to the signed-in customer.
+app.get("/favorites", verifyToken, verifyRenter, async (req, res) => {
+  const saved = await favorites.find({ customerId: req.user._id }).toArray();
+  res.json(await equipment.find({ _id: { $in: saved.map((row) => row.equipmentId) }, status: "Approved" }).toArray());
+});
+app.put("/favorites/:id", verifyToken, verifyRenter, async (req, res) => {
+  const equipmentId = objectId(req.params.id);
+  if (!(await equipment.findOne({ _id: equipmentId, status: "Approved" }))) fail(404, "Equipment not found.");
+  await favorites.updateOne({ customerId: req.user._id, equipmentId }, { $setOnInsert: { createdAt: new Date() } }, { upsert: true });
+  res.json({ ok: true });
+});
+app.delete("/favorites/:id", verifyToken, verifyRenter, async (req, res) => {
+  await favorites.deleteOne({ customerId: req.user._id, equipmentId: objectId(req.params.id) });
+  res.json({ ok: true });
+});
+
+// Parse calendar dates as UTC days so rental totals use whole dates.
+function parseDay(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) fail(400, "Choose valid rental dates.");
+  const date = new Date(value);
+  if (!Number.isFinite(+date) || date.toISOString().slice(0, 10) !== value) fail(400, "Choose valid rental dates.");
+  return date;
+}
+
+app.post("/bookings", verifyToken, verifyRenter, async (req, res) => {
+  const equipmentId = objectId(req.body.equipmentId);
+  const start = parseDay(req.body.start);
+  const end = parseDay(req.body.end);
+  // Count both the first and last rental day.
+  const days = (end.getTime() - start.getTime()) / millisecondsPerDay + 1;
+  const quantity = Number(req.body.quantity);
+  const phone = String(req.body.phone || "").trim().slice(0, 40);
+  const address = String(req.body.address || "").trim().slice(0, 400);
+  if (req.body.start < new Date().toISOString().slice(0, 10) || days < 1 || days > 365 || !Number.isSafeInteger(quantity) || quantity < 1 || !phone || !address) fail(400, "Check your dates, quantity, phone, and address.");
+
+  const result = await client.withSession((session) => session.withTransaction(async () => {
+    // Updating this item first serializes concurrent reservations for the same equipment.
+    const item = await equipment.findOneAndUpdate({ _id: equipmentId, status: "Approved" }, { $inc: { bookingVersion: 1 } }, { session, returnDocument: "after" });
+    if (!item) fail(404, "Equipment unavailable.");
+    const overlappingBookings = await bookings.find({
+      equipmentId,
+      status: "Confirmed",
+      start: { $lte: end },
+      end: { $gte: start },
+    }, { session }).toArray();
+
+    // Check stock for each day because bookings can overlap only part of the rental.
+    for (let day = start.getTime(); day <= end.getTime(); day += millisecondsPerDay) {
+      let reserved = 0;
+      for (const booking of overlappingBookings) {
+        if (Number(booking.start) <= day && Number(booking.end) >= day) {
+          reserved += booking.quantity;
+        }
+      }
+      if (reserved + quantity > item.quantity) fail(409, "This quantity is unavailable for the selected dates.");
+    }
+    // Round partial weeks or months up to a full rental period.
+    const billablePeriods = Math.ceil(days / daysPerPeriod[item.rentalType]);
+    const total = Math.round(item.price * billablePeriods * quantity * 100) / 100;
+    // Future gateway: replace manual confirmation with a pending reservation and a verified payment callback.
+    return bookings.insertOne({
+      equipmentId, equipmentName: item.name, customerId: req.user._id,
+      customerName: req.user.name, ownerId: item.ownerId, ownerName: item.ownerName,
+      start, end, days, quantity, total, phone, address,
+      notes: String(req.body.notes || "").slice(0, 1000),
+      status: "Confirmed", paymentStatus: "Unpaid", paymentMethod: "Manual", createdAt: new Date(),
+    }, { session });
+  }));
+  res.status(201).json({ id: result.insertedId });
+});
+
+app.get("/bookings", verifyToken, async (req, res) => {
+  // Admins see every rental. Owners and customers only see their own records.
+  const filter = {};
+  if (req.user.role === "Owner") {
+    filter.ownerId = req.user._id;
+  } else if (req.user.role !== "Admin") {
+    filter.customerId = req.user._id;
+  }
+  res.json(await bookings.find(filter).sort({ createdAt: -1 }).toArray());
+});
+
+// Admins record manual payments and manage rental status here.
+app.patch("/admin/bookings/:id", verifyToken, verifyAdmin, async (req, res) => {
+  const update = {};
+  if (["Confirmed", "Completed", "Cancelled"].includes(req.body.status)) update.status = req.body.status;
+  if (["Paid", "Unpaid"].includes(req.body.paymentStatus)) update.paymentStatus = req.body.paymentStatus;
+  if (!Object.keys(update).length) fail(400, "Choose a valid status.");
+  // A cancelled rental cannot be reopened because its stock may have been reserved again.
+  const filter = { _id: objectId(req.params.id) };
+  if (update.status) filter.status = "Confirmed";
+  if (update.status === "Completed") filter.end = { $lt: new Date(new Date().toISOString().slice(0, 10)) };
+  if (!(await bookings.updateOne(filter, { $set: update })).matchedCount) fail(409, "The booking cannot be updated.");
+  res.json({ ok: true });
+});
+
+app.use((_, res) => res.status(404).json({ message: "Route not found." }));
+app.use((error, req, res, next) => {
+  const status = error.status || 500;
+  if (status === 500) console.error(error.name);
+  res.status(status).json({ message: status === 500 ? "Server error." : error.message });
+});
+
+// Connect and prepare the indexes before accepting requests.
+await client.connect();
+await favorites.createIndex({ customerId: 1, equipmentId: 1 }, { unique: true });
+await bookings.createIndex({ equipmentId: 1, start: 1, end: 1 });
+app.listen(port, () => console.log("MACHORA API listening on port " + port));
