@@ -9,7 +9,7 @@ export function createStripePayments({ client, bookings, payments, frontendOrigi
     const id = booking._id.toString();
     return stripe.checkout.sessions.create({
       mode: "payment",
-      payment_method_types: ["card"],
+
       client_reference_id: id,
       metadata: { bookingId: id },
       line_items: [{
