@@ -2,7 +2,7 @@
 
 Express and MongoDB API for equipment, favorites, rentals, and administration.
 
-Live URL: Pending deployment.
+Live URL: https://sever-9.vercel.app/
 
 ## Run locally
 
@@ -30,7 +30,7 @@ Sign out and back in after changing the role. The Admin dashboard can assign Own
 
 ### Add six demo listings
 
-In a demo database, run `node seed-demo.js owner@example.com` with the email of an existing Owner. This adds six approved sample listings for that account. Use real listings for a public deployment.
+In a demo database, sign in as an Owner and add six listings. Sign in as an Admin and approve them so all six appear on the home page.
 
 ### Stripe Checkout
 
@@ -59,4 +59,4 @@ Cash on delivery remains available. Admins can mark those bookings paid manually
 
 ## Submission
 
-Deploy frontend and API, then add their live links to both READMEs. Verify a fresh page load, a reload on a protected route, Google login, and a rental from listing approval through manual payment. Share the two repository URLs and examiner credentials through your course submission channel.
+Verify a fresh page load, a reload on a protected route, Google login, and a rental from listing approval through Stripe Checkout and payment confirmation. Share the two repository URLs and examiner credentials through your course submission channel.
