@@ -100,7 +100,6 @@ function createStripePayments({ client, bookings, payments, frontendOrigin, secr
       }],
       success_url: frontendOrigin + "/payment/success?booking=" + id,
       cancel_url: frontendOrigin + "/payment/cancel?booking=" + id,
-      expires_at: Math.floor(Date.now() / 1000) + 31 * 60,
     }, { idempotencyKey: "machora-booking-" + id });
   }
 
