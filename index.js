@@ -445,6 +445,20 @@ app.get("/bookings", verifyToken, async (req, res) => {
   res.json(await bookings.find(filter).sort({ createdAt: -1 }).toArray());
 });
 
+// Dashboard totals need only payment amounts and dates.
+app.get("/analytics/payments", verifyToken, async (req, res) => {
+  const { role, _id } = req.user;
+  if (role !== "Admin" && role !== "Owner") fail(403, "Access denied.");
+
+  const filter = { provider: "Stripe", currency };
+  if (role === "Owner") filter.ownerId = _id;
+
+  const records = await payments.find(filter, {
+    projection: { _id: 0, amount: 1, paidAt: 1 },
+  }).toArray();
+  res.json(records);
+});
+
 // Admins record manual payments and manage rental status here.
 app.patch("/admin/bookings/:id", verifyToken, verifyAdmin, async (req, res) => {
   const update = {};
@@ -456,6 +470,8 @@ app.patch("/admin/bookings/:id", verifyToken, verifyAdmin, async (req, res) => {
   if (update.status) filter.status = "Confirmed";
   if (update.paymentStatus || update.status === "Cancelled") filter.paymentMethod = { $ne: "Stripe" };
   if (update.status === "Completed") filter.end = { $lt: new Date(new Date().toISOString().slice(0, 10)) };
+  if (update.paymentStatus === "Paid") update.paidAt = new Date();
+  if (update.paymentStatus === "Unpaid") update.paidAt = null;
   if (!(await bookings.updateOne(filter, { $set: update })).matchedCount) fail(409, "The booking cannot be updated.");
   res.json({ ok: true });
 });
