@@ -111,6 +111,39 @@ function createStripePayments({ client, bookings, payments, frontendOrigin, secr
     return expired.status === "expired";
   }
 
+  // Both the signed webhook and the Stripe API can confirm a paid session.
+  async function confirmPaidCheckout(checkout) {
+    if (checkout.payment_status !== "paid") return;
+    const match = { stripeSessionId: checkout.id, paymentMethod: "Stripe", status: "Awaiting payment" };
+    await client.withSession((session) => session.withTransaction(async () => {
+      const booking = await bookings.findOne(match, { session });
+      if (!booking) return;
+      if (
+        checkout.client_reference_id !== booking._id.toString() ||
+        checkout.currency !== currency ||
+        checkout.amount_total !== Math.round(booking.total * 100)
+      ) throw new Error("Stripe payment does not match the booking.");
+
+      const paidAt = new Date();
+      // The booking ID is unique in payments, so webhook retries cannot record a second payment.
+      await payments.updateOne({ _id: booking._id }, {
+        $setOnInsert: {
+          bookingId: booking._id, customerId: booking.customerId, ownerId: booking.ownerId,
+          provider: "Stripe", sessionId: checkout.id, paymentIntentId: checkout.payment_intent,
+          amount: checkout.amount_total, currency, paidAt,
+        },
+      }, { session, upsert: true });
+      await bookings.updateOne(match, {
+        $set: { status: "Confirmed", paymentStatus: "Paid", paidAt },
+      }, { session });
+    }));
+  }
+
+  async function syncCheckoutPayment(sessionId) {
+    const checkout = await stripe.checkout.sessions.retrieve(sessionId);
+    await confirmPaidCheckout(checkout);
+  }
+
   async function handleWebhook(req, res) {
     if (!stripe) return res.status(503).json({ message: "Stripe is not configured." });
 
@@ -128,34 +161,13 @@ function createStripePayments({ client, bookings, payments, frontendOrigin, secr
     if (event.type === "checkout.session.expired" || event.type === "checkout.session.async_payment_failed") {
       await bookings.updateOne(match, { $set: { status: "Cancelled", paymentStatus: "Unpaid" } });
     } else if (["checkout.session.completed", "checkout.session.async_payment_succeeded"].includes(event.type) && checkout.payment_status === "paid") {
-      await client.withSession((session) => session.withTransaction(async () => {
-        const booking = await bookings.findOne(match, { session });
-        if (!booking) return;
-        if (
-          checkout.client_reference_id !== booking._id.toString() ||
-          checkout.currency !== currency ||
-          checkout.amount_total !== Math.round(booking.total * 100)
-        ) throw new Error("Stripe payment does not match the booking.");
-
-        const paidAt = new Date();
-        // The booking ID is unique in payments, so webhook retries cannot record a second payment.
-        await payments.updateOne({ _id: booking._id }, {
-          $setOnInsert: {
-            bookingId: booking._id, customerId: booking.customerId, ownerId: booking.ownerId,
-            provider: "Stripe", sessionId: checkout.id, paymentIntentId: checkout.payment_intent,
-            amount: checkout.amount_total, currency, paidAt,
-          },
-        }, { session, upsert: true });
-        await bookings.updateOne(match, {
-          $set: { status: "Confirmed", paymentStatus: "Paid", paidAt },
-        }, { session });
-      }));
+      await confirmPaidCheckout(checkout);
     }
 
     res.json({ received: true });
   }
 
-  return { enabled: Boolean(stripe), createCheckout, cancelCheckout, handleWebhook };
+  return { enabled: Boolean(stripe), createCheckout, cancelCheckout, handleWebhook, syncCheckoutPayment };
 }
 
 // Express setup: Stripe needs the original request body before JSON parsing.
@@ -411,6 +423,22 @@ app.get("/bookings/:id/payment", verifyToken, verifyRenter, async (req, res) => 
   );
   if (!booking) fail(404, "Booking not found.");
   res.json(booking);
+});
+
+// Check a stored Stripe session if the customer returns before the webhook arrives.
+app.post("/bookings/:id/payment/sync", verifyToken, verifyRenter, async (req, res) => {
+  const filter = { _id: objectId(req.params.id), customerId: req.user._id, paymentMethod: "Stripe" };
+  const booking = await bookings.findOne(filter);
+  if (!booking) fail(404, "Booking not found.");
+
+  if (stripePayments.enabled && booking.status === "Awaiting payment" && booking.stripeSessionId) {
+    await stripePayments.syncCheckoutPayment(booking.stripeSessionId);
+  }
+
+  const paymentStatus = await bookings.findOne(filter, {
+    projection: { equipmentId: 1, equipmentName: 1, paymentStatus: 1, status: 1 },
+  });
+  res.json(paymentStatus);
 });
 
 app.post("/bookings/:id/payment/cancel", verifyToken, verifyRenter, async (req, res) => {
