@@ -46,7 +46,7 @@ In a demo database, sign in as an Owner and add six listings. Sign in as an Admi
 
 For deployment, register an HTTPS endpoint at `/payments/stripe/webhook` in Stripe for the same events. Use the deployed endpoint’s signing secret and set `FRONTEND_URL` to the live web address. Use matching test or live credentials. [Stripe webhook setup](https://docs.stripe.com/events/set-up-events.md)
 
-Cash on delivery remains available. Admins can mark those bookings paid manually. An unpaid Stripe reservation releases its stock when Stripe confirms expiry or the customer cancels it.
+Admins can still update payment status for existing cash-on-delivery bookings. An unpaid Stripe reservation releases its stock when Stripe confirms expiry or the customer cancels it.
 
 ### Packages
 

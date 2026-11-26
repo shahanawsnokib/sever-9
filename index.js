@@ -319,12 +319,10 @@ function parseDay(value) {
 
 app.post("/bookings", verifyToken, verifyRenter, async (req, res) => {
   const equipmentId = objectId(req.body.equipmentId);
-  const paymentMethod = req.body.paymentMethod ?? "Manual";
-  if (!["Manual", "Cash on delivery", "Stripe"].includes(paymentMethod)) {
-    fail(400, "Choose a supported payment method.");
+  if (req.body.paymentMethod !== undefined && req.body.paymentMethod !== "Stripe") {
+    fail(400, "New bookings require Stripe Checkout.");
   }
-  const payOnline = paymentMethod === "Stripe";
-  if (payOnline && !stripePayments.enabled) fail(503, "Online payment is not configured.");
+  if (!stripePayments.enabled) fail(503, "Online payment is not configured.");
   const start = parseDay(req.body.start);
   const end = parseDay(req.body.end);
   // Count both the first and last rental day.
@@ -367,22 +365,22 @@ app.post("/bookings", verifyToken, verifyRenter, async (req, res) => {
     // Round partial weeks or months up to a full rental period.
     const billablePeriods = Math.ceil(days / daysPerPeriod[item.rentalType]);
     const total = Math.round(item.price * billablePeriods * quantity * 100) / 100;
-    if (payOnline && (!Number.isFinite(total) || total <= 0)) fail(400, "This rental does not have a valid online price.");
+    if (!Number.isFinite(total) || total <= 0) fail(400, "This rental does not have a valid online price.");
     const reservation = {
       _id: new ObjectId(),
       equipmentId, equipmentName: item.name, customerId: req.user._id,
       customerName: req.user.name, ownerId: item.ownerId, ownerName: item.ownerName,
       start, end, days, quantity, total, phone, address,
       notes: String(req.body.notes || "").slice(0, 1000),
-      status: payOnline ? "Awaiting payment" : "Confirmed",
-      paymentStatus: "Unpaid", paymentMethod, createdAt: new Date(),
-      ...(payOnline ? { checkoutSetupDeadline: new Date(Date.now() + 5 * 60_000) } : {}),
+      status: "Awaiting payment",
+      paymentStatus: "Unpaid",
+      paymentMethod: "Stripe",
+      createdAt: new Date(),
+      checkoutSetupDeadline: new Date(Date.now() + 5 * 60_000),
     };
     await bookings.insertOne(reservation, { session });
     return reservation;
   }));
-
-  if (!payOnline) return res.status(201).json({ id: booking._id });
 
   try {
     const checkout = await stripePayments.createCheckout(booking);
